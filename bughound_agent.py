@@ -83,11 +83,26 @@ class BugHoundAgent:
             self._log("ANALYZE", f"API Error: {str(e)}. Falling back to heuristics.")
             return self._heuristic_analyze(code_snippet)
 
-        issues = self._parse_json_array_of_issues(raw)
+        raw_items = self._parse_json_array_of_issues(raw)
 
-        if issues is None:
+        if raw_items is None:
             self._log("ANALYZE", "LLM output was not parseable JSON. Falling back to heuristics.")
             return self._heuristic_analyze(code_snippet)
+
+        # Validate each issue against the prompt's schema. Invalid severities would
+        # otherwise score zero risk and make a fix look safer than it is.
+        issues = self._normalize_issues(raw_items)
+        dropped = len(raw_items) - len(issues)
+
+        if raw_items and not issues:
+            self._log(
+                "ANALYZE",
+                f"LLM issues failed schema validation ({dropped} dropped). Falling back to heuristics.",
+            )
+            return self._heuristic_analyze(code_snippet)
+
+        if dropped:
+            self._log("ANALYZE", f"Dropped {dropped} invalid issue(s) from LLM output.")
 
         return issues
 
@@ -173,30 +188,37 @@ class BugHoundAgent:
     # ----------------------------
     # Parsing + utilities
     # ----------------------------
-    def _parse_json_array_of_issues(self, text: str) -> Optional[List[Dict[str, str]]]:
+    def _parse_json_array_of_issues(self, text: str) -> Optional[List[Any]]:
+        """Return the raw JSON array from the model's reply, or None if there isn't one."""
         text = text.strip()
         parsed = self._try_json_loads(text)
         if isinstance(parsed, list):
-            return self._normalize_issues(parsed)
+            return parsed
 
         array_str = self._extract_first_json_array(text)
         if array_str:
             parsed2 = self._try_json_loads(array_str)
             if isinstance(parsed2, list):
-                return self._normalize_issues(parsed2)
+                return parsed2
 
         return None
 
     def _normalize_issues(self, arr: List[Any]) -> List[Dict[str, str]]:
+        """Keep only issues that match the schema: severity Low/Medium/High and a non-empty msg."""
+        valid_severities = {"low": "Low", "medium": "Medium", "high": "High"}
         issues: List[Dict[str, str]] = []
         for item in arr:
             if not isinstance(item, dict):
                 continue
+            severity = valid_severities.get(str(item.get("severity", "")).strip().lower())
+            msg = str(item.get("msg", "")).strip()
+            if severity is None or not msg:
+                continue
             issues.append(
                 {
                     "type": str(item.get("type", "Issue")),
-                    "severity": str(item.get("severity", "Unknown")),
-                    "msg": str(item.get("msg", "")).strip(),
+                    "severity": severity,
+                    "msg": msg,
                 }
             )
         return issues
